@@ -683,91 +683,9 @@ def spring_mesh_along_axis(template_pts, anchor, axis, length,
     return spline.tube(radius=tube_radius)
 
 
-def make_wall_lattice(n_per_axis, x_arr, z_arr):
-    """(x, z) positions of the sites tiling the wall.
-
-    The spacing is chosen COMMENSURATE with the box (spacing = box_width / n_per_axis) so the
-    lattice tiles seamlessly under the periodic boundary conditions. Forcing an exact 1.000 A
-    spacing into a 6 Bohr box would leave a 0.175-site remainder and put a visible seam at the
-    x/z faces. With n_per_axis = 3 the spacing is 2.0 Bohr = 1.058 A, i.e. within 6% of the
-    whiteboard's 1 A and periodic to machine precision.
-    """
-    if n_per_axis <= 1:
-        return np.zeros((1, 2)), 0.0
-    Lx = float(x_arr.max() - x_arr.min())
-    spacing = Lx / n_per_axis
-    c = (np.arange(n_per_axis) - (n_per_axis - 1) / 2.0) * spacing
-    return np.array([[a, b] for a in c for b in c], dtype=np.float64), spacing
-
-
-@njit(cache=True)
-def lattice_potential_and_forces(density, x_arr, y_arr, z_arr,
-                                 sites_x, sites_z, y_c, A, b, dV):
-    """ONE fused pass: the classical-electron potential on the grid AND the Ehrenfest force
-    on every site, together.
-
-    This is the function that makes step 3 affordable. The obvious implementation -- a Python
-    loop over sites, each building full-grid temporaries (r, V, force integrand) with numpy --
-    allocates ~4 arrays of nx*ny*nz per site per step. Here the grid is walked once per site
-    with zero temporaries, and the force reduction is accumulated in the same sweep that fills
-    the potential, so the exponential is evaluated once instead of twice.
-    """
-    nx = x_arr.size
-    ny = y_arr.size
-    nz = z_arr.size
-    N = sites_x.size
-    V = np.zeros((nx, ny, nz))
-    F = np.zeros(N)
-
-    for s in range(N):
-        sx = sites_x[s]
-        sz = sites_z[s]
-        sy = y_c[s]
-        acc = 0.0
-        for i in range(nx):
-            ddx = x_arr[i] - sx
-            ddx2 = ddx * ddx
-            for j in range(ny):
-                ddy = y_arr[j] - sy
-                ddxy2 = ddx2 + ddy * ddy
-                for k in range(nz):
-                    ddz = z_arr[k] - sz
-                    r = np.sqrt(ddxy2 + ddz * ddz) + 1e-10
-                    v = A * np.exp(-r / b)
-                    V[i, j, k] += v
-                    acc += density[i, j, k] * (-v * (ddy / (b * r)))
-        F[s] = acc * dV
-    return V, F
-
-
-def build_springs_mesh(template_pts, sites_x, sites_z, y_nuc, y_c,
-                       tube_radius=0.02, min_length=0.02):
-    """All N springs as a SINGLE mesh: one PolyData holding N polylines, tubed once.
-
-    Tubing each spring separately would mean N VTK filter calls per frame; this is one.
-    """
-    npts = template_pts.shape[0]
-    N = sites_x.size
-    all_pts = np.empty((N * npts, 3))
-    lines = np.empty(N * (npts + 1), dtype=np.int64)
-    for s in range(N):
-        length = max(float(y_nuc - y_c[s]), min_length)
-        block = template_pts * np.array([1.0, length, 1.0])
-        # local +Y maps to world -Y (nucleus -> electron), so flip y
-        block = block * np.array([1.0, -1.0, 1.0])
-        block = block + np.array([sites_x[s], y_nuc, sites_z[s]])
-        all_pts[s * npts:(s + 1) * npts] = block
-        off = s * (npts + 1)
-        lines[off] = npts
-        lines[off + 1:off + 1 + npts] = np.arange(s * npts, (s + 1) * npts)
-    poly = pv.PolyData(all_pts, lines=lines)
-    return poly.tube(radius=tube_radius)
-
-
 def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250, steps_per_frame=40,
                           y_wall_pos=2.5,
                           nucleus_offset=0.05, r0=None,
-                          n_sites_per_axis=3,
                           nucleus_pos=None, A_nuc=None):
     """
     GEOMETRY (one site = anchored nucleus + electron on a spring):
@@ -815,52 +733,33 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     m_c, k_spring = 0.2, 0.2
     A_au, b_au = 200.0 / 27.2114, 0.3 / 0.52918
     BOHR_PER_ANGSTROM = 1.0 / 0.52917721
-
-    # 1D axes (the fused kernel indexes these instead of the big 3D meshgrids)
-    x_arr = np.ascontiguousarray(X[:, 0, 0])
-    y_arr = np.ascontiguousarray(Y[0, :, 0])
-    z_arr = np.ascontiguousarray(Z[0, 0, :])
-    dV = dx * dy * dz
+    X_sq = X ** 2
+    Z_sq = Z ** 2
 
     if r0 is None:
         r0 = 1.0 * BOHR_PER_ANGSTROM          # whiteboard: r0 = 1 Angstrom = 1.890 Bohr
+    if nucleus_pos is None:
+        # הגרעין יושב מעט *אחרי* הקיר (בתוך חומר הקיר), לא לפניו
+        nucleus_pos = (0.0, y_wall_pos + nucleus_offset, 0.0)
     if A_nuc is None:
         A_nuc = A_au
 
-    if nucleus_pos is not None:
-        y_nuc = nucleus_pos[1]
-        sites = np.array([[nucleus_pos[0], nucleus_pos[2]]], dtype=np.float64)
-        spacing = 0.0
-    else:
-        # הגרעין יושב מעט *אחרי* הקיר (בתוך חומר הקיר), לא לפניו
-        y_nuc = y_wall_pos + nucleus_offset
-        sites, spacing = make_wall_lattice(n_sites_per_axis, x_arr, z_arr)
-
-    sites_x = np.ascontiguousarray(sites[:, 0])
-    sites_z = np.ascontiguousarray(sites[:, 1])
-    N_sites = sites_x.size
-
+    y_nuc = nucleus_pos[1]
     # שיווי המשקל של האלקטרון נקבע ע"י הגרעין: בדיוק r0 לפניו
     y_eq = y_nuc - r0
-    print(f"  wall lattice: {N_sites} sites ({n_sites_per_axis}x{n_sites_per_axis}), "
-          f"spacing {spacing:.4f} Bohr = {spacing * 0.52917721:.3f} Angstrom")
-    print(f"  nuclei anchored at y = {y_nuc:.3f} (wall at {y_wall_pos}, offset {nucleus_offset})")
+    print(f"  nucleus anchored at y = {y_nuc:.3f} (wall at {y_wall_pos}, offset {nucleus_offset})")
     print(f"  electron equilibrium  y_eq = y_nuc - r0 = {y_eq:.3f}  (r0 = {r0:.3f} Bohr = "
           f"{r0 * 0.52917721:.2f} Angstrom)")
 
-    # כל אלקטרון קלאסי הוא דרגת חופש נפרדת -> מערכים באורך N
-    state = {'psi': psi_init, 't': 0.0,
-             'y_c_curr': np.full(N_sites, y_eq),
-             'y_c_prev': np.full(N_sites, y_eq)}
+    state = {'psi': psi_init, 't': 0.0, 'y_c_curr': y_eq, 'y_c_prev': y_eq}
 
-    # --- הגרעינים החיוביים: מקובעים, ולכן הפוטנציאל שלהם סטטי לחלוטין ---
-    # מסכמים על כל האתרים פעם אחת בלבד ומאחדים לתוך פוטנציאל הקיר. כך כל
-    # שורת הגרעינים *לא* מוסיפה שום עלות חישובית בלולאה הפנימית.
+    # --- הגרעין החיובי: מקובע במקום, ולכן הפוטנציאל שלו סטטי לחלוטין ---
+    # מחשבים אותו פעם אחת בלבד ומאחדים אותו לתוך פוטנציאל הקיר. כך התוספת
+    # הזו *לא* מוסיפה שום עלות חישובית בלולאה הפנימית.
     # הסימן שלילי: הגרעין (+|e|) מושך את האלקטרון הקוונטי (-|e|).
-    V_nuc = np.zeros_like(V_wall)
-    for sx, sz in sites:
-        r_nuc = np.sqrt((X - sx) ** 2 + (Y - y_nuc) ** 2 + (Z - sz) ** 2) + 1e-10
-        V_nuc += -A_nuc * np.exp(-r_nuc / b_au)
+    xn, yn, zn = nucleus_pos
+    r_nuc = np.sqrt((X - xn) ** 2 + (Y - yn) ** 2 + (Z - zn) ** 2) + 1e-10
+    V_nuc = -A_nuc * np.exp(-r_nuc / b_au)
     V_static = V_wall + V_nuc
 
     print("Setting up Off-Screen Renderer...")
@@ -869,26 +768,26 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     plotter = pv.Plotter(off_screen=True, window_size=[1920, 1080])
     plotter.set_background('black')
 
-    # 2. האלקטרונים הקלאסיים — כל N הכדורים כאקטור *אחד* דרך glyph,
-    #    במקום N קריאות add_mesh נפרדות
-    electron_pts = np.column_stack([sites_x, state['y_c_curr'], sites_z])
-    electrons_poly = pv.PolyData(electron_pts)
-    plotter.add_mesh(electrons_poly.glyph(geom=pv.Sphere(radius=0.15), scale=False, orient=False),
-                     color='green', smooth_shading=True, specular=0.5, name='electrons')
+    # 2. הוספת החלקיק הקלאסי (האלקטרון על הקפיץ)
+    particle = pv.Sphere(radius=0.15, center=(0, y_eq, 0))
+    plotter.add_mesh(particle, color='green', smooth_shading=True, specular=0.5)
 
-    # 2b. הקפיצים — כל N הקפיצים כרשת אחת (polyline אחת לכל אתר, tube בקריאה אחת).
-    # הכיוון קבוע (מהגרעין כלפי -Y), ולכן קפיץ יכול רק להתקצר לכיוון אפס ולעולם
-    # לא "יתהפך" לצד השני של האלקטרון.
+    # 2b. הקפיץ (ויזואלי בלבד בשלב הזה — לא משפיע על הפיזיקה)
+    # העוגן מקובע בקיר עצמו, והקפיץ מתוח ממנו כלפי מטה (-Y) אל האלקטרון.
+    # הכיוון קבוע, ולכן הקפיץ יכול רק להתקצר לכיוון אפס — הוא לעולם לא "יתהפך"
+    # לצד השני של האלקטרון גם אם האלקטרון יעבור את נקודת העיגון.
+    # הקפיץ מעוגן *בגרעין* (לא בקיר) — הוא מייצג את הקשר גרעין-אלקטרון
+    spring_anchor = nucleus_pos
+    spring_axis = (0.0, -1.0, 0.0)
     spring_template = make_spring_template(n_coils=6, n_points=60, coil_radius=0.06)
-    springs_mesh = build_springs_mesh(spring_template, sites_x, sites_z, y_nuc, state['y_c_curr'])
-    plotter.add_mesh(springs_mesh, color='silver', name='springs', specular=0.6)
+    spring_mesh = spring_mesh_along_axis(spring_template, spring_anchor, spring_axis,
+                                         y_nuc - y_eq)
+    plotter.add_mesh(spring_mesh, color='silver', name='spring', specular=0.6)
 
-    # 2c. הגרעינים החיוביים (+|e|) — מקובעים, ולכן מצוירים פעם אחת ולא מתעדכנים בלולאה.
-    # הם *אמורים* לא לזוז: זה כל הרעיון של "anchored".
-    nuclei_pts = np.column_stack([sites_x, np.full(N_sites, y_nuc), sites_z])
-    nuclei_poly = pv.PolyData(nuclei_pts)
-    plotter.add_mesh(nuclei_poly.glyph(geom=pv.Sphere(radius=0.16), scale=False, orient=False),
-                     color='red', smooth_shading=True, specular=0.5, name='nuclei')
+    # 2c. הגרעין החיובי (+|e|) — מקובע, ולכן מצויר פעם אחת ולא מתעדכן בלולאה.
+    # הוא *אמור* לא לזוז: זה כל הרעיון של "anchored".
+    nucleus = pv.Sphere(radius=0.16, center=nucleus_pos)
+    plotter.add_mesh(nucleus, color='red', smooth_shading=True, specular=0.5)
 
     # 2d. הקיר עצמו — עד עכשיו הוא היה *בלתי נראה* (רק פוטנציאל ב-y=y_wall_pos),
     # ולכן היה בלתי אפשרי לשפוט אם הגרעין לפני או אחרי הקיר. עכשיו הוא מצויר.
@@ -918,10 +817,7 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
 
     # --- Baselines for Δ tracking (mirrors animate_dashboard3D) ---
     initial_norm = np.sum(np.abs(psi_init) ** 2) * dx * dy * dz
-    V_e_init, _ = lattice_potential_and_forces(np.abs(psi_init) ** 2, x_arr, y_arr, z_arr,
-                                               sites_x, sites_z, state['y_c_curr'],
-                                               A_au, b_au, dV)
-    V_initial = V_static + V_e_init
+    V_initial = V_static + A_au * np.exp(-np.sqrt(X_sq + (Y - y_eq) ** 2 + Z_sq) / b_au)
     H_psi_init = hamiltonianOperator3D(psi_init, dx, dy, dz, V_initial)
     initial_e_quant = np.real(np.sum(np.conj(psi_init) * H_psi_init) * dx * dy * dz)
     initial_e_class = 0.0
@@ -985,21 +881,22 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
 
     # 5. לולאת הרינדור (הפיזיקה והכתיבה לוידאו)
     for frame in range(frames):
+        y_start_frame = state['y_c_curr']
+
         # הרצת הפיזיקה
         for _ in range(steps_per_frame):
-            # מעבר *אחד* מאוחד: הפוטנציאל של כל האלקטרונים על הרשת + הכוח על כל אתר
-            V_ws, forces = lattice_potential_and_forces(
-                np.abs(state['psi']) ** 2, x_arr, y_arr, z_arr,
-                sites_x, sites_z, state['y_c_curr'], A_au, b_au, dV)
+            dy_c = Y - state['y_c_curr']
+            r_safe = np.sqrt(X_sq + dy_c ** 2 + Z_sq) + 1e-10
 
-            # V_static כבר כולל את הקיר ואת *כל* הגרעינים המקובעים (מחושב פעם אחת מחוץ ללולאה)
+            V_ws = A_au * np.exp(-(r_safe - 1e-10) / b_au)
+            # V_static כבר כולל את הקיר ואת הגרעין המקובע (מחושב פעם אחת מחוץ ללולאה)
             V_current = V_static + V_ws
 
-            # Verlet וקטורי על כל N דרגות החופש בבת אחת
-            acceleration = (-k_spring * (state['y_c_curr'] - y_eq) + forces) / m_c
+            quantum_force = np.sum((np.abs(state['psi']) ** 2) * (-V_ws * (dy_c / (b_au * r_safe)))) * dx * dy * dz
+            acceleration = (-k_spring * (state['y_c_curr'] - y_eq) + quantum_force) / m_c
+
             y_c_next = 2 * state['y_c_curr'] - state['y_c_prev'] + acceleration * dt ** 2
             state['y_c_prev'], state['y_c_curr'] = state['y_c_curr'], y_c_next
-
             state['psi'] = RK4_3D(state['t'], state['psi'], dx, dy, dz, dt, V_current)
             state['t'] += dt
 
@@ -1007,30 +904,24 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
         new_density = np.abs(state['psi']) ** 2
         grid["Density"][:] = new_density.flatten(order="F")
 
-        # עדכון כל האלקטרונים כאקטור אחד
-        electron_pts = np.column_stack([sites_x, state['y_c_curr'], sites_z])
-        electrons_poly = pv.PolyData(electron_pts)
-        plotter.add_mesh(electrons_poly.glyph(geom=pv.Sphere(radius=0.15), scale=False, orient=False),
-                         color='green', smooth_shading=True, specular=0.5, name='electrons')
+        dy_frame = state['y_c_curr'] - y_start_frame
+        particle.translate([0, dy_frame, 0], inplace=True)
 
-        # עדכון כל הקפיצים כרשת אחת
-        springs_mesh = build_springs_mesh(spring_template, sites_x, sites_z, y_nuc,
-                                          state['y_c_curr'])
-        plotter.add_mesh(springs_mesh, color='silver', name='springs', specular=0.6)
+        # עדכון הקפיץ: העוגן והכיוון קבועים, רק האורך משתנה (מתקצר לכיוון אפס)
+        spring_mesh = spring_mesh_along_axis(spring_template, spring_anchor, spring_axis,
+                                             y_nuc - state['y_c_curr'])
+        plotter.add_mesh(spring_mesh, color='silver', name='spring', specular=0.6)
 
         # --- חישוב הדלתות (אנרגיה קוונטית/מכנית ונורמליזציה) לפריים הנוכחי ---
-        V_e_final, _ = lattice_potential_and_forces(new_density, x_arr, y_arr, z_arr,
-                                                    sites_x, sites_z, state['y_c_curr'],
-                                                    A_au, b_au, dV)
-        V_current_final = V_static + V_e_final
+        dy_c_final = Y - state['y_c_curr']
+        V_current_final = V_static + A_au * np.exp(-np.sqrt(X_sq + dy_c_final ** 2 + Z_sq) / b_au)
 
         current_norm = np.sum(np.abs(state['psi']) ** 2) * dx * dy * dz
         quant_E = np.real(
             np.sum(np.conj(state['psi']) * hamiltonianOperator3D(state['psi'], dx, dy, dz,
                                                                  V_current_final)) * dx * dy * dz)
-        # אנרגיה קלאסית = סכום על *כל* האתרים
-        class_E = np.sum(0.5 * m_c * (((state['y_c_curr'] - state['y_c_prev']) / dt) ** 2)
-                         + 0.5 * k_spring * (state['y_c_curr'] - y_eq) ** 2)
+        class_E = 0.5 * m_c * (((state['y_c_curr'] - state['y_c_prev']) / dt) ** 2) + 0.5 * k_spring * (
+                    state['y_c_curr'] - y_eq) ** 2
 
         delta_norm = current_norm - initial_norm
         delta_e_quant = quant_E - initial_e_quant
@@ -1124,12 +1015,7 @@ if __name__ == "__main__":
     # Run the 3D Dashboard
    # animate_dashboard3D(psi, dx, dy, dz, dt, V_wall, X, Y, Z)
 
-    # n_sites_per_axis=3 -> 3x3 = 9 sites on the wall, spacing 2.0 Bohr = 1.058 Angstrom.
-    # The spacing is box_width/n so the lattice is seamless under the periodic BCs; forcing
-    # exactly 1.000 A into a 6 Bohr box would leave a fractional site and a seam at the faces.
-    # Set n_sites_per_axis=1 to get the old single-site behaviour back.
-    render_mp4_simulation(psi, dx, dy, dz, dt, V_wall, X, Y, Z,
-                          n_sites_per_axis=3)
+    render_mp4_simulation(psi, dx, dy, dz, dt, V_wall, X, Y, Z)
 
     # Run the PyVista GPU Engine
     #animate_pyvista3D(psi, dx, dy, dz, dt, V_wall, X, Y, Z)
