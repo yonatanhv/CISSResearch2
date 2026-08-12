@@ -2,12 +2,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib.gridspec as gridspec
-from numba import njit
+from numba import njit, prange
 import pyvista as pv
 
 # 2D Quantum Functions
 
-@njit
+@njit(parallel=True, cache=True)
 def hamiltonianOperator3D(psi, dx, dy, dz, V):
     nx, ny, nz = psi.shape
     result = np.empty_like(psi)
@@ -17,7 +17,9 @@ def hamiltonianOperator3D(psi, dx, dy, dz, V):
     dy2 = dy ** 2
     dz2 = dz ** 2
 
-    for i in range(nx):
+    # Parallel over i: iteration i only ever writes result[i, :, :], so there's
+    # no cross-iteration write race (same reasoning as lattice_potential_and_forces).
+    for i in prange(nx):
         # The modulo (%) enforces Periodic Boundary Conditions!
         i_next = (i + 1) % nx
         i_prev = (i - 1) % nx
@@ -64,6 +66,44 @@ def createWavePacket3D(X, Y, Z, x0, y0, z0, sigma_x, sigma_y, sigma_z, ky, m, dx
     psi /= np.sqrt(probability_sum)
 
     return psi
+
+def createWavePacketSlab3D(X, Y, Z, y0, sigma_y, ky, dx, dy, dz, m=0):
+    """Extended wavepacket: a SLAB, not a blob.
+
+    Gaussian in y (the propagation direction) with width sigma_y, and UNIFORM across x and z.
+    Physically this is a plane wave incident on a periodic surface -- the standard setup for
+    surface scattering -- rather than a localized 3D ball.
+
+    Two problems dissolve at once:
+
+    1. COST. A localized sigma = 5 A ball needs a box of +/-3sigma = +/-28 Bohr in EVERY
+       direction, and since the coupling range b = 0.3 A independently pins dx <= 0.19 Bohr,
+       that is ~27 million grid points. As a slab, x and z only need a few lattice periods,
+       which is ~35x cheaper for the same sigma_y = 5 A and the same 1 A lattice spacing.
+
+    2. COVERAGE. A blob narrower than the lattice spacing drives only the site it happens to
+       sit over (measured: centre force 0.65 vs corner 0.026). Being uniform in x,z, a slab
+       drives every site in the wall equally -- which is the whole point of tiling the wall.
+
+    Because the packet is uniform in x,z it is periodic in those directions by construction,
+    so it is exactly compatible with the periodic boundary conditions: no wrap-around leak.
+
+    m != 0 still attaches the exp(i*m*phi) vortex phase about the y axis (the CISS chirality
+    knob). Note the r^|m| radial factor of the localized version is deliberately dropped here:
+    it grows without bound away from the axis, which is meaningless for an extended state.
+    """
+    gaussian_y = np.exp(-((Y - y0) ** 2) / (2 * sigma_y ** 2))
+    plane_wave = np.exp(1j * ky * Y)
+
+    psi = gaussian_y * plane_wave
+    if m != 0:
+        phi = np.arctan2(Z, X)
+        psi = psi * np.exp(1j * m * phi)
+
+    probability_sum = np.sum(np.abs(psi) ** 2) * dx * dy * dz
+    psi = psi / np.sqrt(probability_sum)
+    return psi.astype(np.complex128)
+
 
 @njit
 def timeDerivative3D(t, psi, dx, dy, dz, V):
@@ -700,44 +740,90 @@ def make_wall_lattice(n_per_axis, x_arr, z_arr):
     return np.array([[a, b] for a in c for b in c], dtype=np.float64), spacing
 
 
-@njit(cache=True)
-def lattice_potential_and_forces(density, x_arr, y_arr, z_arr,
-                                 sites_x, sites_z, y_c, A, b, dV):
-    """ONE fused pass: the classical-electron potential on the grid AND the Ehrenfest force
-    on every site, together.
+@njit(parallel=True, cache=True)
+def lattice_potential_and_forces(psi, x_arr, y_arr, z_arr,
+                                 sites_x, sites_z, y_c, A, b, dV,
+                                 cutoff, V_out, F_part, period_x, period_z):
+    """ONE fused, PARALLEL pass: the classical-electron potential on the grid AND the
+    Ehrenfest force on every site, together.
 
-    This is the function that makes step 3 affordable. The obvious implementation -- a Python
-    loop over sites, each building full-grid temporaries (r, V, force integrand) with numpy --
-    allocates ~4 arrays of nx*ny*nz per site per step. Here the grid is walked once per site
-    with zero temporaries, and the force reduction is accumulated in the same sweep that fills
-    the potential, so the exponential is evaluated once instead of twice.
+    This is the function that makes step 3 affordable. Four things are going on:
+
+    1. FUSED. The obvious implementation -- a Python loop over sites, each building full-grid
+       numpy temporaries (r, V, force integrand) -- allocates ~4 arrays of nx*ny*nz per site
+       per step and evaluates the exponential twice. Here the grid is walked once with zero
+       temporaries and the force reduction accumulates in the same sweep as the potential.
+
+    2. PARALLEL over the x index. Iteration i touches only V_out[i, :, :] and F_part[i, :],
+       so there is no write race and no need for atomics. The per-site force is reduced
+       afterwards by summing F_part over i.
+
+    3. PREALLOCATED. V_out and F_part are supplied by the caller and reused every step,
+       instead of allocating a fresh nx*ny*nz array 50,000 times.
+
+    4. CUTOFF. The coupling decays as exp(-r/b) with b = 0.567 Bohr, so past r = cutoff it is
+       numerically irrelevant (at 12b the factor is 6e-6). Sites are confined to the wall
+       plane, so in a LARGE box most of the volume is out of range of every site and gets
+       skipped entirely -- this is what keeps the cost from scaling as N_sites x full_grid
+       once the box grows. In the current 6 Bohr box nothing is far enough away to skip, so
+       it costs a branch and saves nothing yet.
+
+    5. MINIMUM IMAGE in x and z. The Laplacian is periodic in every direction, so the
+       potential has to be too, or sites near the x/z faces silently lose the part of their
+       interaction that should wrap around. Measured without it: the 36 sites of a periodic
+       lattice under a perfectly uniform slab packet felt forces spread over 25%, when by
+       symmetry they must all be identical. With minimum image the spread drops to roundoff.
+       y is deliberately NOT wrapped: the wall lives there and the packet never reaches that
+       face, so wrapping it would fold the wall barrier back onto the incoming packet.
+
+    psi is passed complex and |psi|^2 is formed inline, saving one full-grid allocation/step.
     """
     nx = x_arr.size
     ny = y_arr.size
     nz = z_arr.size
     N = sites_x.size
-    V = np.zeros((nx, ny, nz))
-    F = np.zeros(N)
+    cut2 = cutoff * cutoff
 
-    for s in range(N):
-        sx = sites_x[s]
-        sz = sites_z[s]
-        sy = y_c[s]
-        acc = 0.0
-        for i in range(nx):
-            ddx = x_arr[i] - sx
+    V_out[:, :, :] = 0.0
+    F_part[:, :] = 0.0
+
+    for i in prange(nx):
+        for s in range(N):
+            ddx = x_arr[i] - sites_x[s]
+            # minimum image: fold into [-period_x/2, +period_x/2]
+            ddx = ddx - period_x * np.round(ddx / period_x)
+            if ddx < -cutoff or ddx > cutoff:
+                continue
             ddx2 = ddx * ddx
+            sy = y_c[s]
+            sz = sites_z[s]
+            acc = 0.0
             for j in range(ny):
                 ddy = y_arr[j] - sy
                 ddxy2 = ddx2 + ddy * ddy
+                if ddxy2 > cut2:
+                    continue
                 for k in range(nz):
                     ddz = z_arr[k] - sz
-                    r = np.sqrt(ddxy2 + ddz * ddz) + 1e-10
+                    ddz = ddz - period_z * np.round(ddz / period_z)
+                    r2 = ddxy2 + ddz * ddz
+                    if r2 > cut2:
+                        continue
+                    r = np.sqrt(r2) + 1e-10
                     v = A * np.exp(-r / b)
-                    V[i, j, k] += v
-                    acc += density[i, j, k] * (-v * (ddy / (b * r)))
-        F[s] = acc * dV
-    return V, F
+                    V_out[i, j, k] += v
+                    pr = psi[i, j, k].real
+                    pi = psi[i, j, k].imag
+                    acc += (pr * pr + pi * pi) * (-v * (ddy / (b * r)))
+            F_part[i, s] = acc
+
+    F = np.zeros(N)
+    for s in range(N):
+        tot = 0.0
+        for i in range(nx):
+            tot += F_part[i, s]
+        F[s] = tot * dV
+    return F
 
 
 def build_springs_mesh(template_pts, sites_x, sites_z, y_nuc, y_c,
@@ -767,7 +853,7 @@ def build_springs_mesh(template_pts, sites_x, sites_z, y_nuc, y_c,
 def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250, steps_per_frame=40,
                           y_wall_pos=2.5,
                           nucleus_offset=0.05, r0=None,
-                          n_sites_per_axis=3,
+                          n_sites_per_axis=3, render_stride=1,
                           nucleus_pos=None, A_nuc=None):
     """
     GEOMETRY (one site = anchored nucleus + electron on a spring):
@@ -848,18 +934,29 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     print(f"  electron equilibrium  y_eq = y_nuc - r0 = {y_eq:.3f}  (r0 = {r0:.3f} Bohr = "
           f"{r0 * 0.52917721:.2f} Angstrom)")
 
-    # כל אלקטרון קלאסי הוא דרגת חופש נפרדת -> מערכים באורך N
+    # כל אלקטרון קלאסי הוא דרגת חופש נפרדת -> מערכים באורך N.
+    # שומרים מהירות (ולא y_prev) כי המשלב עבר ל-velocity-Verlet עם הערכת אמצע.
     state = {'psi': psi_init, 't': 0.0,
              'y_c_curr': np.full(N_sites, y_eq),
-             'y_c_prev': np.full(N_sites, y_eq)}
+             'v_c': np.zeros(N_sites)}
 
     # --- הגרעינים החיוביים: מקובעים, ולכן הפוטנציאל שלהם סטטי לחלוטין ---
     # מסכמים על כל האתרים פעם אחת בלבד ומאחדים לתוך פוטנציאל הקיר. כך כל
     # שורת הגרעינים *לא* מוסיפה שום עלות חישובית בלולאה הפנימית.
     # הסימן שלילי: הגרעין (+|e|) מושך את האלקטרון הקוונטי (-|e|).
+    # periods of the transverse (genuinely periodic) directions, for minimum image.
+    # +dx / +dz because linspace endpoints are inclusive: the period is one cell MORE
+    # than (max - min).
+    period_x = float(x_arr.max() - x_arr.min()) + dx
+    period_z = float(z_arr.max() - z_arr.min()) + dz
+
     V_nuc = np.zeros_like(V_wall)
     for sx, sz in sites:
-        r_nuc = np.sqrt((X - sx) ** 2 + (Y - y_nuc) ** 2 + (Z - sz) ** 2) + 1e-10
+        ddx = X - sx
+        ddx -= period_x * np.round(ddx / period_x)      # minimum image, as in the kernel
+        ddz = Z - sz
+        ddz -= period_z * np.round(ddz / period_z)
+        r_nuc = np.sqrt(ddx ** 2 + (Y - y_nuc) ** 2 + ddz ** 2) + 1e-10
         V_nuc += -A_nuc * np.exp(-r_nuc / b_au)
     V_static = V_wall + V_nuc
 
@@ -869,25 +966,35 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     plotter = pv.Plotter(off_screen=True, window_size=[1920, 1080])
     plotter.set_background('black')
 
+    # --- גדלים ויזואליים ביחס למרווח הסריג, לא בערכים מוחלטים ---
+    # קודם הרדיוסים היו קבועים (0.15 Bohr) — בקופסה באורך 70 Bohr זה 0.2% מהתמונה,
+    # כלומר בלתי נראה. עכשיו הכל מתכייל לפי spacing, אז זה נראה נכון בכל גודל קופסה.
+    vis = spacing if spacing > 0 else r0
+    R_ELECTRON = 0.22 * vis
+    R_NUCLEUS = 0.24 * vis
+    COIL_R = 0.10 * vis
+    TUBE_R = 0.035 * vis
+
     # 2. האלקטרונים הקלאסיים — כל N הכדורים כאקטור *אחד* דרך glyph,
     #    במקום N קריאות add_mesh נפרדות
     electron_pts = np.column_stack([sites_x, state['y_c_curr'], sites_z])
     electrons_poly = pv.PolyData(electron_pts)
-    plotter.add_mesh(electrons_poly.glyph(geom=pv.Sphere(radius=0.15), scale=False, orient=False),
+    plotter.add_mesh(electrons_poly.glyph(geom=pv.Sphere(radius=R_ELECTRON), scale=False, orient=False),
                      color='green', smooth_shading=True, specular=0.5, name='electrons')
 
     # 2b. הקפיצים — כל N הקפיצים כרשת אחת (polyline אחת לכל אתר, tube בקריאה אחת).
     # הכיוון קבוע (מהגרעין כלפי -Y), ולכן קפיץ יכול רק להתקצר לכיוון אפס ולעולם
     # לא "יתהפך" לצד השני של האלקטרון.
-    spring_template = make_spring_template(n_coils=6, n_points=60, coil_radius=0.06)
-    springs_mesh = build_springs_mesh(spring_template, sites_x, sites_z, y_nuc, state['y_c_curr'])
+    spring_template = make_spring_template(n_coils=6, n_points=60, coil_radius=COIL_R)
+    springs_mesh = build_springs_mesh(spring_template, sites_x, sites_z, y_nuc,
+                                     state['y_c_curr'], tube_radius=TUBE_R)
     plotter.add_mesh(springs_mesh, color='silver', name='springs', specular=0.6)
 
     # 2c. הגרעינים החיוביים (+|e|) — מקובעים, ולכן מצוירים פעם אחת ולא מתעדכנים בלולאה.
     # הם *אמורים* לא לזוז: זה כל הרעיון של "anchored".
     nuclei_pts = np.column_stack([sites_x, np.full(N_sites, y_nuc), sites_z])
     nuclei_poly = pv.PolyData(nuclei_pts)
-    plotter.add_mesh(nuclei_poly.glyph(geom=pv.Sphere(radius=0.16), scale=False, orient=False),
+    plotter.add_mesh(nuclei_poly.glyph(geom=pv.Sphere(radius=R_NUCLEUS), scale=False, orient=False),
                      color='red', smooth_shading=True, specular=0.5, name='nuclei')
 
     # 2d. הקיר עצמו — עד עכשיו הוא היה *בלתי נראה* (רק פוטנציאל ב-y=y_wall_pos),
@@ -898,14 +1005,19 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     plotter.add_mesh(wall_plane, color='deepskyblue', opacity=0.35, show_edges=True,
                      edge_color='deepskyblue', name='wall')
 
-    # 3. הכנת הרשת התלת-ממדית לחבילת הגל
+    # 3. הכנת הרשת התלת-ממדית לחבילת הגל.
+    # render_stride: הפיזיקה תמיד ברזולוציה מלאה, אבל *הרינדור* מדלל.
+    # ב-27M ווקסלים add_volume נחנק לגמרי; stride=3 מוריד ל-1M בלי לגעת בפיזיקה.
+    rs = max(1, int(render_stride))
+    dens_view = (np.abs(state['psi']) ** 2)[::rs, ::rs, ::rs]
     grid = pv.ImageData()
-    grid.dimensions = np.array(state['psi'].shape)
-    grid.spacing = (dx, dy, dz)
+    grid.dimensions = np.array(dens_view.shape)
+    grid.spacing = (dx * rs, dy * rs, dz * rs)
     grid.origin = (X.min(), Y.min(), Z.min())
-
-    density = np.abs(state['psi']) ** 2
-    grid.point_data["Density"] = density.flatten(order="F")
+    grid.point_data["Density"] = dens_view.flatten(order="F")
+    if rs > 1:
+        print(f"  render_stride={rs}: volume shows {dens_view.size/1e6:.2f} M voxels "
+              f"(physics stays at {state['psi'].size/1e6:.2f} M)")
 
     # רינדור ענן (Volume) עם צבע וסף שקיפות כדי שייראה כמו מפת חום
     plotter.add_volume(grid, scalars="Density", cmap="magma", opacity="linear", show_scalar_bar=False)
@@ -916,12 +1028,20 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     #plotter.camera.azimuth += 15  # Rotates the camera sideways (try numbers between 45 and 90)
     plotter.camera.elevation += 15  # Drops the camera angle down for a more straight-on view
 
+    # --- מאגרים שמוקצים פעם אחת ומשומשים מחדש בכל צעד (במקום 50,000 הקצאות) ---
+    V_buf = np.zeros((x_arr.size, y_arr.size, z_arr.size))
+    F_part_buf = np.zeros((x_arr.size, N_sites))
+    # מעבר ל-12*b: exp(-12) ~ 6e-6, כלומר תרומה זניחה מעבר לרדיוס הזה
+    cutoff = 12.0 * b_au
+
     # --- Baselines for Δ tracking (mirrors animate_dashboard3D) ---
     initial_norm = np.sum(np.abs(psi_init) ** 2) * dx * dy * dz
-    V_e_init, _ = lattice_potential_and_forces(np.abs(psi_init) ** 2, x_arr, y_arr, z_arr,
+    # also seeds accel_force, the opening force of the velocity-Verlet recursion
+    accel_force = lattice_potential_and_forces(psi_init, x_arr, y_arr, z_arr,
                                                sites_x, sites_z, state['y_c_curr'],
-                                               A_au, b_au, dV)
-    V_initial = V_static + V_e_init
+                                               A_au, b_au, dV, cutoff, V_buf, F_part_buf,
+                                               period_x, period_z)
+    V_initial = V_static + V_buf
     H_psi_init = hamiltonianOperator3D(psi_init, dx, dy, dz, V_initial)
     initial_e_quant = np.real(np.sum(np.conj(psi_init) * H_psi_init) * dx * dy * dz)
     initial_e_class = 0.0
@@ -987,49 +1107,67 @@ def render_mp4_simulation(psi_init, dx, dy, dz, dt, V_wall, X, Y, Z, frames=1250
     for frame in range(frames):
         # הרצת הפיזיקה
         for _ in range(steps_per_frame):
-            # מעבר *אחד* מאוחד: הפוטנציאל של כל האלקטרונים על הרשת + הכוח על כל אתר
-            V_ws, forces = lattice_potential_and_forces(
-                np.abs(state['psi']) ** 2, x_arr, y_arr, z_arr,
-                sites_x, sites_z, state['y_c_curr'], A_au, b_au, dV)
+            # --- velocity-Verlet with a MIDPOINT potential for the quantum step ---
+            # The old ordering advanced psi with the potential from the START of the interval,
+            # which is only 1st order in dt: measured error ratio exactly 2.00 per halving.
+            # Evaluating the quantum step at the midpoint classical position makes the whole
+            # coupling 2nd order (measured ratio 4.00), and at dt=4e-4 it is ~1160x more
+            # accurate. Since the splitting error goes as dt^p * T, that is what makes a long
+            # run affordable at all.
+            acceleration = (-k_spring * (state['y_c_curr'] - y_eq) + accel_force) / m_c
+            v_half = state['v_c'] + 0.5 * acceleration * dt
+            y_mid = state['y_c_curr'] + 0.5 * v_half * dt
 
+            # potential at the MIDPOINT classical position
+            lattice_potential_and_forces(state['psi'], x_arr, y_arr, z_arr,
+                                         sites_x, sites_z, y_mid, A_au, b_au, dV,
+                                         cutoff, V_buf, F_part_buf, period_x, period_z)
             # V_static כבר כולל את הקיר ואת *כל* הגרעינים המקובעים (מחושב פעם אחת מחוץ ללולאה)
-            V_current = V_static + V_ws
-
-            # Verlet וקטורי על כל N דרגות החופש בבת אחת
-            acceleration = (-k_spring * (state['y_c_curr'] - y_eq) + forces) / m_c
-            y_c_next = 2 * state['y_c_curr'] - state['y_c_prev'] + acceleration * dt ** 2
-            state['y_c_prev'], state['y_c_curr'] = state['y_c_curr'], y_c_next
+            V_current = V_static + V_buf
 
             state['psi'] = RK4_3D(state['t'], state['psi'], dx, dy, dz, dt, V_current)
+            state['y_c_curr'] = state['y_c_curr'] + v_half * dt
+
+            # forces at the NEW position; reused as the opening force of the next step,
+            # so this costs one kernel call per step, not two
+            accel_force = lattice_potential_and_forces(
+                state['psi'], x_arr, y_arr, z_arr,
+                sites_x, sites_z, state['y_c_curr'], A_au, b_au, dV,
+                cutoff, V_buf, F_part_buf, period_x, period_z)
+            acceleration = (-k_spring * (state['y_c_curr'] - y_eq) + accel_force) / m_c
+            state['v_c'] = v_half + 0.5 * acceleration * dt
             state['t'] += dt
 
-        # עדכון הגרפיקה בזיכרון
+        # עדכון הגרפיקה בזיכרון (מדולל לפי render_stride)
         new_density = np.abs(state['psi']) ** 2
-        grid["Density"][:] = new_density.flatten(order="F")
+        grid["Density"][:] = new_density[::rs, ::rs, ::rs].flatten(order="F")
 
         # עדכון כל האלקטרונים כאקטור אחד
         electron_pts = np.column_stack([sites_x, state['y_c_curr'], sites_z])
         electrons_poly = pv.PolyData(electron_pts)
-        plotter.add_mesh(electrons_poly.glyph(geom=pv.Sphere(radius=0.15), scale=False, orient=False),
+        plotter.add_mesh(electrons_poly.glyph(geom=pv.Sphere(radius=R_ELECTRON), scale=False, orient=False),
                          color='green', smooth_shading=True, specular=0.5, name='electrons')
 
         # עדכון כל הקפיצים כרשת אחת
         springs_mesh = build_springs_mesh(spring_template, sites_x, sites_z, y_nuc,
-                                          state['y_c_curr'])
+                                          state['y_c_curr'], tube_radius=TUBE_R)
         plotter.add_mesh(springs_mesh, color='silver', name='springs', specular=0.6)
 
         # --- חישוב הדלתות (אנרגיה קוונטית/מכנית ונורמליזציה) לפריים הנוכחי ---
-        V_e_final, _ = lattice_potential_and_forces(new_density, x_arr, y_arr, z_arr,
-                                                    sites_x, sites_z, state['y_c_curr'],
-                                                    A_au, b_au, dV)
-        V_current_final = V_static + V_e_final
+        lattice_potential_and_forces(state['psi'], x_arr, y_arr, z_arr,
+                                     sites_x, sites_z, state['y_c_curr'],
+                                     A_au, b_au, dV, cutoff, V_buf, F_part_buf,
+                                               period_x, period_z)
+        V_current_final = V_static + V_buf
 
         current_norm = np.sum(np.abs(state['psi']) ** 2) * dx * dy * dz
         quant_E = np.real(
             np.sum(np.conj(state['psi']) * hamiltonianOperator3D(state['psi'], dx, dy, dz,
                                                                  V_current_final)) * dx * dy * dz)
-        # אנרגיה קלאסית = סכום על *כל* האתרים
-        class_E = np.sum(0.5 * m_c * (((state['y_c_curr'] - state['y_c_prev']) / dt) ** 2)
+        # אנרגיה קלאסית = סכום על *כל* האתרים.
+        # משתמשים במהירות האמיתית (v_c) ולא בהפרש אחורי (y_curr - y_prev)/dt, שסבל
+        # מפיגור של חצי צעד ולכן הכניס רעש מדומה לאנרגיה הקינטית.
+        class_E = np.sum(0.5 * m_c * state['v_c'] ** 2
                          + 0.5 * k_spring * (state['y_c_curr'] - y_eq) ** 2)
 
         delta_norm = current_norm - initial_norm
@@ -1098,38 +1236,95 @@ def plot_energy_deltas(t_arr, e_quant, e_class, e_tot):
 
 
 if __name__ == "__main__":
-    # Shrink the physical box, but double the resolution!
-    Resolution = 8
-    L_limit = 3.0
+    # ----------------------------------------------------------------------------------
+    # WHY ONLY ONE SPRING RESPONDS, and the two ways out.
+    #
+    # sigma = 0.75 -> FWHM 1.77 Bohr, which is SMALLER than the 2.0 Bohr lattice spacing,
+    # so the packet slips between sites and only the centre one feels it (measured: centre
+    # force 0.65 vs corner 0.026, a factor of 25).
+    #
+    #   A) widen the packet in this box -- but +/-3 Bohr is too tight. To get appreciable
+    #      density at the neighbouring site you need sigma ~1.5, and that leaks 4.6% of
+    #      |psi|^2 per axis straight through the periodic faces. Not worth it.
+    #
+    #   B) grow the box and spend the speed reclaimed below. L_limit = 6.0 with
+    #      n_sites_per_axis = 6 keeps the SAME 1.058 A spacing, gives 36 sites, and lets
+    #      sigma_xz = 1.5 drive ~9 of them with a wrap leak of only 6e-5 % per axis.
+    #      Cost: 31x more kernel work per step, but 10x fewer steps and then spread over
+    #      cores -- roughly break-even against the run you just did.
+    #
+    # To switch to B: L_limit = 6.0, n_sites_per_axis = 6, and sigma_x/sigma_z = 1.5 below.
+    # ----------------------------------------------------------------------------------
+    ANGSTROM = 1.0 / 0.52917721        # 1 A in Bohr = 1.8897
 
-    # Adding +1 ensures the grid lands exactly on 0.0 (restores perfect symmetry)
-    numPoints = int(2 * L_limit * Resolution) + 1
+    # ==================================================================================
+    # PERFECT CUBE.
+    #
+    # The cube side is NOT free: sigma_y = 5 A means the packet alone spans 6 sigma = 30 A,
+    # so a cube has to be at least 30 A on EVERY side -- including x and z, which physically
+    # only needed a few lattice periods. That is what makes this configuration expensive:
+    #
+    #     24 A cube -> too small, the packet wraps into itself
+    #     30 A cube -> 301^3 = 27.3 M points, 900 sites, ~2.6 GB, ~19x the previous run
+    #     36 A cube -> 361^3 = 47.0 M points, 1296 sites, ~4.5 GB, ~29x
+    #
+    # 30 A is the minimum cube that holds a 5 A packet, so that is what is set below.
+    #
+    # IF THIS IS TOO SLOW, in order of preference:
+    #   1. FRAMES = 400        (linear: 3x faster, no physics change at all)
+    #   2. render_stride = 4   (rendering only, physics untouched)
+    #   3. SIGMA_A = 3.0       -> 18 A cube, ~5x cheaper. Changes the physics you specified.
+    # ==================================================================================
+    SPACING_A = 1.0
+    SIGMA_A = 5.0
+    N_SITES_PER_AXIS = 30                       # 30 x 1.0 A = 30 A cube side
+    L_HALF = 0.5 * N_SITES_PER_AXIS * SPACING_A * ANGSTROM      # +/-28.35 Bohr
+    SIGMA_Y = SIGMA_A * ANGSTROM
 
-    x_arr = np.linspace(-L_limit, L_limit, numPoints)
-    y_arr = np.linspace(-L_limit, L_limit, numPoints)
-    z_arr = np.linspace(-L_limit, L_limit, numPoints)
+    # dx is pinned by the COUPLING RANGE b = 0.3 A = 0.567 Bohr (~3 points across it),
+    # NOT by the packet or the box. This is the constraint that makes a big cube costly.
+    D = 0.567 / 3.0
+    n_side = int(round(2 * L_HALF / D)) + 1
+
+    x_arr = np.linspace(-L_HALF, L_HALF, n_side)
+    y_arr = np.linspace(-L_HALF, L_HALF, n_side)
+    z_arr = np.linspace(-L_HALF, L_HALF, n_side)
 
     X, Y, Z = np.meshgrid(x_arr, y_arr, z_arr, indexing='ij')
     dx = x_arr[1] - x_arr[0]
     dy = y_arr[1] - y_arr[0]
     dz = z_arr[1] - z_arr[0]
 
-    dt = 0.00002
-    # Shifted start position slightly up since the box is smaller
-    psi = createWavePacket3D(X, Y, Z, 0.0, -1, 0.0, 0.75, 0.75, 0.75, 8.0, 0, dx, dy, dz)
+    # the packet fills the cube (6 sigma == the side), so it starts centred and the wall
+    # sits near the +y face; the interaction begins essentially at t=0
+    Y_WALL = 0.70 * L_HALF
+    Y0_PACKET = -0.30 * L_HALF
 
-    # Moved the wall slightly closer
-    V_wall = LJ_wall3D(Y, 2.5, 2.0, 0.5, 150.0)
+    KY = 2.0                     # capped by dx: ~10 points per de Broglie wavelength
+    dt = 0.0015                  # ~17% of the RK4 stability limit at this dx
+    STEPS_PER_FRAME = 6
+    FRAMES = 1250
+    RENDER_STRIDE = 3            # 27 M voxels would choke add_volume; physics stays full-res
 
-    # Run the 3D Dashboard
-   # animate_dashboard3D(psi, dx, dy, dz, dt, V_wall, X, Y, Z)
+    print(f"CUBE {n_side}^3 = {X.size/1e6:.2f} M points, side "
+          f"{2*L_HALF*0.52917721:.1f} A, dx={dx:.4f} Bohr")
+    print(f"  memory ~{X.size*16*6/1e9:.1f} GB for psi + RK4 stages")
+    print(f"  {N_SITES_PER_AXIS}x{N_SITES_PER_AXIS} = {N_SITES_PER_AXIS**2} sites "
+          f"at {SPACING_A:.3f} A spacing")
+    print(f"  simulated time {FRAMES*STEPS_PER_FRAME*dt:.2f} a.u. "
+          f"({FRAMES*STEPS_PER_FRAME} steps)")
 
-    # n_sites_per_axis=3 -> 3x3 = 9 sites on the wall, spacing 2.0 Bohr = 1.058 Angstrom.
-    # The spacing is box_width/n so the lattice is seamless under the periodic BCs; forcing
-    # exactly 1.000 A into a 6 Bohr box would leave a fractional site and a seam at the faces.
-    # Set n_sites_per_axis=1 to get the old single-site behaviour back.
+    # SLAB packet: Gaussian in y, uniform in x,z -> every site is driven equally
+    psi = createWavePacketSlab3D(X, Y, Z, Y0_PACKET, SIGMA_Y, KY, dx, dy, dz, m=0)
+
+    V_wall = LJ_wall3D(Y, Y_WALL, 2.0, 0.5, 150.0)
+
     render_mp4_simulation(psi, dx, dy, dz, dt, V_wall, X, Y, Z,
-                          n_sites_per_axis=3)
+                          frames=FRAMES,
+                          steps_per_frame=STEPS_PER_FRAME,
+                          y_wall_pos=Y_WALL,
+                          n_sites_per_axis=N_SITES_PER_AXIS,
+                          render_stride=RENDER_STRIDE)
 
     # Run the PyVista GPU Engine
     #animate_pyvista3D(psi, dx, dy, dz, dt, V_wall, X, Y, Z)
